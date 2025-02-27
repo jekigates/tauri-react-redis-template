@@ -40,6 +40,22 @@ function App() {
         }
     }
 
+    async function checkRedisConnection() {
+        try {
+            const response: ApiResponse<string> = await invoke(
+                "check_redis_connection"
+            );
+
+            if (response.status === "error") {
+                console.error("Redis Error:", response.message);
+            } else {
+                console.log("✅ Redis Status:", response.data);
+            }
+        } catch (error) {
+            console.error("Unexpected error:", error);
+        }
+    }
+
     return (
         <main>
             <h1>Welcome to Tauri + React</h1>
@@ -64,6 +80,10 @@ function App() {
                 <Button type="submit">Greet</Button>
             </form>
             <p>{greetMsg}</p>
+
+            <Button variant="outline" onClick={checkRedisConnection}>
+                Check Redis Connection
+            </Button>
         </main>
     );
 }
