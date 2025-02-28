@@ -1,25 +1,17 @@
 use anyhow::Result;
+use deadpool_redis::{redis::cmd, Config as RedisConfig, Pool as RedisPool, Runtime};
 use dotenv::dotenv;
-use entity::post::{self, Entity as Post};
-use redis::Client;
-use redis::Connection;
+use entity::post::{self, ActiveModel as PostActiveModel, Entity as Post};
+use sea_orm::ActiveValue::Set;
+use sea_orm::{ActiveModelTrait, QueryOrder};
 use sea_orm::{Database, DatabaseConnection, EntityTrait};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::env;
-use std::sync::Mutex;
-use tauri::{Manager, State};
-use tokio::runtime::Runtime;
+use tauri::{command, Manager, State};
 
 struct AppState {
-    welcome_message: &'static str,
     db: DatabaseConnection,
-    redis: Mutex<Connection>,
-}
-
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str, state: State<'_, AppState>) -> String {
-    format!("{} says {}", name, state.welcome_message)
+    redis_pool: RedisPool,
 }
 
 #[derive(Serialize)]
@@ -45,32 +37,201 @@ impl<T: Serialize> ApiResponse<T> {
     }
 }
 
-#[tauri::command]
+#[derive(Serialize, Deserialize)]
+struct CachedData<T> {
+    data: T,
+}
+
+async fn cache_set<T: Serialize>(pool: &RedisPool, key: &str, value: &T, ttl: usize) {
+    let mut conn = match pool.get().await {
+        Ok(conn) => conn,
+        Err(err) => {
+            eprintln!("Redis error (cache_set - get connection): {}", err);
+            return; // ✅ Silently fail, don't stop execution
+        }
+    };
+
+    let json_value = match serde_json::to_string(&CachedData { data: value }) {
+        Ok(json) => json,
+        Err(err) => {
+            eprintln!("Redis error (cache_set - serialization): {}", err);
+            return;
+        }
+    };
+
+    if let Err(err) = cmd("SETEX")
+        .arg(&[key, &ttl.to_string(), &json_value])
+        .query_async::<()>(&mut conn)
+        .await
+    {
+        eprintln!("Redis error (cache_set - SETEX): {}", err);
+    }
+}
+
+async fn cache_delete(pool: &RedisPool, key: &str) {
+    let mut conn = match pool.get().await {
+        Ok(conn) => conn,
+        Err(err) => {
+            eprintln!("Redis error (cache_delete - get connection): {}", err);
+            return;
+        }
+    };
+
+    if let Err(err) = cmd("DEL").arg(&[key]).query_async::<()>(&mut conn).await {
+        eprintln!("Redis error (cache_delete - DEL): {}", err);
+    }
+}
+
+async fn cache_get<T: for<'de> Deserialize<'de>>(pool: &RedisPool, key: &str) -> Option<T> {
+    let mut conn = match pool.get().await {
+        Ok(conn) => conn,
+        Err(err) => {
+            eprintln!("Redis error (cache_get - get connection): {}", err);
+            return None; // ✅ Silently fail
+        }
+    };
+
+    let cached_data: Option<String> = match cmd("GET").arg(&[key]).query_async(&mut conn).await {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("Redis error (cache_get - GET): {}", err);
+            return None;
+        }
+    };
+
+    if let Some(json_str) = cached_data {
+        match serde_json::from_str::<CachedData<T>>(&json_str) {
+            Ok(wrapper) => Some(wrapper.data),
+            Err(err) => {
+                eprintln!("Redis error (cache_get - deserialization): {}", err);
+                None
+            }
+        }
+    } else {
+        None
+    }
+}
+
+#[command]
 async fn get_all_posts(
     state: State<'_, AppState>,
 ) -> Result<ApiResponse<Vec<post::Model>>, String> {
-    match Post::find().all(&state.db).await {
-        Ok(posts) => Ok(ApiResponse::success(posts)),
+    let cache_key = "get_all_posts_cache";
+
+    if let Some(cached_posts) = cache_get::<Vec<post::Model>>(&state.redis_pool, cache_key).await {
+        println!("Cache hit: Returning posts from Redis");
+        return Ok(ApiResponse::success(cached_posts));
+    }
+
+    println!("Cache miss: Querying database");
+    match Post::find()
+        .order_by_desc(post::Column::Id)
+        .all(&state.db)
+        .await
+    {
+        Ok(posts) => {
+            cache_set(&state.redis_pool, cache_key, &posts, 60).await;
+            Ok(ApiResponse::success(posts))
+        }
         Err(err) => Ok(ApiResponse::error(format!("Database error: {}", err))),
     }
 }
 
-#[tauri::command]
-fn check_redis_connection(state: State<'_, AppState>) -> ApiResponse<String> {
-    let mut redis_conn = state.redis.lock().unwrap(); // ✅ Lock Redis connection
+#[derive(Deserialize)]
+struct DeletePostRequest {
+    id: i32,
+}
 
-    // ✅ Send PING command to Redis
-    let ping_response: redis::RedisResult<String> = redis::cmd("PING").query(&mut *redis_conn);
+#[command]
+async fn delete_post(
+    state: State<'_, AppState>,
+    payload: DeletePostRequest,
+) -> Result<ApiResponse<()>, String> {
+    match Post::delete_by_id(payload.id).exec(&state.db).await {
+        Ok(delete_result) => {
+            if delete_result.rows_affected == 0 {
+                return Ok(ApiResponse::error(format!(
+                    "No post found with ID: {}",
+                    payload.id
+                )));
+            }
 
-    match ping_response {
-        Ok(ping) => {
-            println!("✅ Redis is connected: {}", ping);
-            ApiResponse::success("Redis is connected".to_string()) // ✅ Return JSON success response
+            cache_delete(&state.redis_pool, "get_all_posts_cache").await;
+            Ok(ApiResponse::success(()))
         }
-        Err(err) => {
-            println!("❌ Redis ping failed: {}", err);
-            ApiResponse::error(format!("Redis connection failed: {}", err)) // ✅ Return JSON error response
+        Err(err) => Ok(ApiResponse::error(format!(
+            "Failed to delete post: {}",
+            err
+        ))),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreatePostRequest {
+    title: String,
+    text: String,
+}
+
+#[command]
+async fn create_post(
+    state: State<'_, AppState>,
+    payload: CreatePostRequest,
+) -> Result<ApiResponse<post::Model>, String> {
+    let new_post = PostActiveModel {
+        title: Set(payload.title),
+        text: Set(payload.text),
+        ..Default::default()
+    };
+
+    match new_post.insert(&state.db).await {
+        Ok(post) => {
+            cache_delete(&state.redis_pool, "get_all_posts_cache").await;
+            Ok(ApiResponse::success(post))
         }
+        Err(err) => Ok(ApiResponse::error(format!(
+            "Failed to create post: {}",
+            err
+        ))),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdatePostRequest {
+    id: i32,
+    title: String,
+    text: String,
+}
+
+#[command]
+async fn update_post(
+    state: State<'_, AppState>,
+    payload: UpdatePostRequest,
+) -> Result<ApiResponse<post::Model>, String> {
+    match Post::find_by_id(payload.id).one(&state.db).await {
+        Ok(Some(existing_post)) => {
+            let mut active_post: PostActiveModel = existing_post.into();
+            active_post.title = Set(payload.title);
+            active_post.text = Set(payload.text);
+
+            match active_post.update(&state.db).await {
+                Ok(updated_post) => {
+                    cache_delete(&state.redis_pool, "get_all_posts_cache").await;
+                    Ok(ApiResponse::success(updated_post))
+                }
+                Err(err) => Ok(ApiResponse::error(format!(
+                    "Failed to update post: {}",
+                    err
+                ))),
+            }
+        }
+        Ok(None) => Ok(ApiResponse::error(format!(
+            "No post found with ID: {}",
+            payload.id
+        ))),
+        Err(err) => Ok(ApiResponse::error(format!(
+            "Database error while updating post: {}",
+            err
+        ))),
     }
 }
 
@@ -84,28 +245,28 @@ pub fn run() {
             let redis_url = env::var("REDIS_URL").expect("REDIS_URL must be set");
 
             // Create the runtime
-            let rt = Runtime::new().unwrap();
+            let rt = tokio::runtime::Runtime::new().unwrap();
 
             // Execute the future, blocking the current thread until completion
             let db = rt
                 .block_on(Database::connect(&database_url))
                 .expect("Failed to connect to database");
 
-            let client = Client::open(redis_url).expect("Failed to create Redis client");
-            let redis_conn = client.get_connection().expect("Failed to connect to Redis");
+            let redis_cfg = RedisConfig::from_url(redis_url);
+            let redis_pool = redis_cfg
+                .create_pool(Some(Runtime::Tokio1))
+                .expect("Failed to create Redis pool");
 
-            app.manage(AppState {
-                welcome_message: "Welcome to Tauri!",
-                db,
-                redis: Mutex::new(redis_conn),
-            });
+            app.manage(AppState { db, redis_pool });
+
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
-            greet,
             get_all_posts,
-            check_redis_connection
+            create_post,
+            delete_post,
+            update_post
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
