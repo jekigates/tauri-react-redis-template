@@ -125,7 +125,7 @@ async fn get_all_posts(
 
     println!("Cache miss: Querying database");
     match Post::find()
-        .order_by_desc(post::Column::Id)
+        .order_by_asc(post::Column::Id)
         .all(&state.db)
         .await
     {

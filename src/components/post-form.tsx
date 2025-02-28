@@ -50,14 +50,12 @@ export function PostForm({
 
     useEffect(() => {
         if (editingPost) {
-            console.log("true");
             setIsUpdate(true);
             form.reset({
                 title: editingPost.title,
                 text: editingPost.text,
             });
         } else {
-            console.log("wi");
             setIsUpdate(false);
             form.reset(defaultValues);
         }

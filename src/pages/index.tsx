@@ -24,7 +24,7 @@ import {
     AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 
-function WelcomePage() {
+function HomePage() {
     const [posts, setPosts] = useState<Post[]>([]);
     const [editingPost, setEditingPost] = useState<Post | null>(null);
 
@@ -184,4 +184,4 @@ function WelcomePage() {
     );
 }
 
-export default WelcomePage;
+export default HomePage;
