@@ -42,7 +42,7 @@ If you prefer not to use Docker, you can install Redis on Windows using WSL. Fol
 1. Clone the repository or download and extract the ZIP file:
 
 ```bash
-git clone https://github.com/yourusername/tauri-react-redis-template.git
+git clone https://github.com/jekigates/tauri-react-redis-template.git
 cd tauri-react-redis-template
 ```
 
