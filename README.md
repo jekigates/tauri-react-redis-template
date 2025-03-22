@@ -17,13 +17,6 @@ This template includes:
 ## 👨‍💻 Created by Jeki Gates  
 If this template helps you, consider leaving a ⭐ to support!  
 
-## Prerequisites
-
-- [Node.js](https://nodejs.org/)
-- [Docker](https://www.docker.com/) (optional, for Redis)
-- [PostgreSQL](https://www.postgresql.org/download/)
-- [Rust](https://www.rust-lang.org/tools/install) (required for Tauri)
-
 ## Setup Instructions
 
 ### 1. Set up Redis
